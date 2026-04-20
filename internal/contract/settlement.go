@@ -15,6 +15,7 @@ type SessionLock struct {
 	ProviderPublicKey string
 	LockedAmount      float64
 	SettledAmount     float64
+	CommittedAmount   float64
 	LastSequence      int64
 	Status            string
 	CreatedAt         time.Time
@@ -65,6 +66,7 @@ func (c *MockSettlementContract) LockCollateral(
 		ProviderPublicKey: providerPubKey,
 		LockedAmount:      amount,
 		SettledAmount:     0,
+		CommittedAmount:   0,
 		LastSequence:      0,
 		Status:            "active",
 		CreatedAt:         time.Now(),
@@ -81,8 +83,8 @@ func (c *MockSettlementContract) VerifyStateUpdate(
 	sequenceNumber int64,
 	committedAmount float64,
 ) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	lock, exists := c.sessions[sessionID]
 	if !exists {
@@ -93,13 +95,15 @@ func (c *MockSettlementContract) VerifyStateUpdate(
 		return fmt.Errorf("session %s is not active (status: %s)", sessionID, lock.Status)
 	}
 
-	if committedAmount < lock.SettledAmount {
+	// Monotonicity check: new committed amount must be greater than current
+	if committedAmount <= lock.CommittedAmount && lock.CommittedAmount > 0 {
 		return fmt.Errorf(
-			"monotonicity violation: committed %.6f is less than already settled %.6f",
-			committedAmount, lock.SettledAmount,
+			"monotonicity violation: committed %.6f is not greater than current %.6f",
+			committedAmount, lock.CommittedAmount,
 		)
 	}
 
+	// Amount must not exceed locked collateral
 	if committedAmount > lock.LockedAmount {
 		return fmt.Errorf(
 			"committed amount %.6f exceeds locked collateral %.6f",
@@ -107,12 +111,17 @@ func (c *MockSettlementContract) VerifyStateUpdate(
 		)
 	}
 
-	if committedAmount <= lock.SettledAmount && lock.SettledAmount > 0 {
+	// Sequence must increase
+	if sequenceNumber <= lock.LastSequence && sequenceNumber != 0 {
 		return fmt.Errorf(
 			"sequence number %d is not greater than last seen %d",
 			sequenceNumber, lock.LastSequence,
 		)
 	}
+
+	// Update tracked committed amount and sequence
+	lock.CommittedAmount = committedAmount
+	lock.LastSequence = sequenceNumber
 
 	return nil
 }
@@ -133,6 +142,7 @@ func (c *MockSettlementContract) Settle(
 		return nil, fmt.Errorf("no collateral found for session %s", sessionID)
 	}
 
+	// Verify output commitment
 	computed := hashOutput(outputData)
 	if computed != proofCommitment {
 		return nil, fmt.Errorf(
@@ -141,6 +151,7 @@ func (c *MockSettlementContract) Settle(
 		)
 	}
 
+	// Monotonicity check against settled amount
 	if committedAmount < lock.SettledAmount {
 		return nil, fmt.Errorf(
 			"monotonicity violation: %.6f < already settled %.6f",
@@ -211,4 +222,3 @@ func hashOutput(output string) string {
 	h := sha256.Sum256([]byte(output))
 	return hex.EncodeToString(h[:])
 }
-
